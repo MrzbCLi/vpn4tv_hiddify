@@ -1,4 +1,4 @@
-name: Build
+name: Build Android & Windows
 on:
   workflow_call:
     inputs:
@@ -21,18 +21,19 @@ env:
   TAG_NAME: "${{ inputs.tag-name }}"
   TARGET_NAME_apk: "Hiddify-Android"
   TARGET_NAME_aab: "Hiddify-Android"
+  TARGET_NAME_windows: "Hiddify-Windows-x64"
 
 jobs:
   test:
+    runs-on: ubuntu-latest
     outputs:
       draftBuildCode: ${{ steps.draftBuildCode.outputs.datetime }}
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
       - uses: subosito/flutter-action@v2.16.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: 'stable'
+          channel: stable
           cache: true
       - name: Prepare
         run: make linux-prepare
@@ -55,41 +56,46 @@ jobs:
           - platform: android-aab
             os: ubuntu-latest
             targets: aab
+          - platform: windows
+            os: windows-2019
+            targets: exe,msix
     runs-on: ${{ matrix.os }}
     steps:
-      - name: checkout
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
+      # Flutter setup
       - name: Setup Flutter
         uses: subosito/flutter-action@v2.16.0
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
-          channel: 'stable'
+          channel: stable
           cache: true
 
+      # Android setup
       - name: Setup Java
+        if: startsWith(matrix.platform,'android')
         uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
+          distribution: zulu
           java-version: 17
-
       - name: Setup NDK
+        if: startsWith(matrix.platform,'android')
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: true
           link-to-sdk: true
-
-      - name: Setup Gradle 8.1
+      - name: Setup Gradle
+        if: startsWith(matrix.platform,'android')
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 7.5
 
-      - name: Setup dependencies
+      - name: Install Dependencies
         run: make ${{ matrix.platform }}-install-dependencies
 
-      - name: Setup Android Signing Properties
-        if: ${{ inputs.upload-artifact }}
+      - name: Android Signing
+        if: ${{ inputs.upload-artifact && startsWith(matrix.platform,'android') }}
         run: |
           echo "${{ secrets.ANDROID_SIGNING_KEY }}" | base64 --decode > android/key.jks
           echo "storeFile=$(pwd)/android/key.jks" > android/key.properties
@@ -97,82 +103,45 @@ jobs:
           echo "keyPassword=${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}" >> android/key.properties
           echo "keyAlias=${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}" >> android/key.properties
 
-      - name: Prepare for ${{ matrix.platform }}
+      - name: Windows Signing
+        if: ${{ inputs.upload-artifact && startsWith(matrix.platform,'windows') }}
+        run: |
+          [IO.File]::WriteAllBytes("windows\sign.pfx", [Convert]::FromBase64String("${{ secrets.WINDOWS_SIGNING_KEY }}"))
+          (Get-Content "windows\packaging\msix\make_config.yaml") -replace '^certificate_password:.*$', 'certificate_password: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}' | Set-Content "windows\packaging\msix\make_config.yaml"
+
+      - name: Prepare Platform
         run: make ${{ matrix.platform }}-prepare
 
-      - name: Build ${{ matrix.platform }}
+      - name: Build Platform
         env:
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: make ${{ matrix.platform }}-release
 
-      - name: Copy to out Android APK
-        if: matrix.platform == 'android-apk'
-        run: |
-          mkdir out
-          ls -R ./build/app/outputs
-          cp ./build/app/outputs/flutter-apk/*arm64-v8a*.apk out/${TARGET_NAME_apk}-arm64.apk || echo "no arm64 apk"
-          cp ./build/app/outputs/flutter-apk/*armeabi-v7a*.apk out/${TARGET_NAME_apk}-arm7.apk || echo "no arm7 apk"
-          cp ./build/app/outputs/flutter-apk/*x86_64*.apk out/${TARGET_NAME_apk}-x86_64.apk || echo "no x64 apk"
-          cp ./build/app/outputs/flutter-apk/app-release.apk out/${TARGET_NAME_apk}-universal.apk || echo "no universal apk"
-
-      - name: Copy to out Android AAB
-        if: matrix.platform == 'android-aab'
-        run: |
-          mkdir out
-          ls -R ./build/app/outputs
-          cp ./build/app/outputs/bundle/release/app-release.aab out/hiddify-android-market.aab || echo "no aab"
-
-      - name: Upload Artifact
-        if: env.UPLOAD_ARTIFACT == 'true'
-        uses: actions/upload-artifact@v4
+      - name: Code Sign Windows
+        if: ${{ inputs.upload-artifact && startsWith(matrix.platform,'windows') }}
+        uses: hiddify/signtool-code-sign-sha256@main
         with:
-          name: ${{ matrix.platform }}
-          path: ./out
-          retention-days: 1
+          certificate: '${{ secrets.WINDOWS_SIGNING_KEY }}'
+          cert-password: '${{ secrets.WINDOWS_SIGNING_PASSWORD }}'
+          cert-sha1: '${{ secrets.WINDOWS_SIGNING_SHA1 }}'
+          folder: 'dist'
+          timestamp-server: 'http://timestamp.digicert.com'
+          recursive: true
+          description: 'Hiddify'
 
-  upload-release:
-    permissions: write-all
-    if: ${{ inputs.upload-artifact && inputs.tag-name != 'draft' }}
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: checkout
-        uses: actions/checkout@v3
-
-      - name: Download Artifact
-        uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
-          pattern: "*"
-          path: ./out/
-
-      - name: Display Files Structure
+      - name: Copy Artifacts
         run: |
-          ls -R ./out
-          mv out/hiddify-android-market.aab hiddify-android-market.aab
+          if [ "${{ matrix.platform }}" = "windows" ]; then ./scripts/package_windows.ps1; fi
+          if [ "${{ matrix.platform }}" = "android-apk" ]; then mkdir -p out; cp ./build/app/outputs/flutter-apk/*.apk out/; fi
+          if [ "${{ matrix.platform }}" = "android-aab" ]; then mkdir -p out; cp ./build/app/outputs/bundle/release/*.aab out/; fi
 
-      - name: prepare_release_message
-        run: |
-          sed 's|RELEASE_TAG|${{ env.TAG_NAME }}|g' ./.github/release_message.md >> release.md
-
-      - name: Upload Release
-        uses: softprops/action-gh-release@v1
+      - name: Upload Debug Symbols
+        if: ${{ inputs.upload-artifact && inputs.tag-name != 'draft' }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          prerelease: true
-          tag_name: ${{ env.TAG_NAME }}
-          body_path: './release.md'
-          files: ./out/*
-
-      - name: Create service_account.json
-        run: echo '${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}' > service_account.json
-
-      - name: Deploy to Google Play Internal Testers
-        uses: r0adkll/upload-google-play@v1
-        with:
-          serviceAccountJson: service_account.json
-          packageName: app.hiddify.com
-          releaseName: ${{ env.TAG_NAME }}
-          releaseFiles: ./hiddify-android-market.aab
-          track: 'beta'
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          SENTRY_DIST: ${{ matrix.platform == 'android-aab' && 'google-play' || 'general' }}
+        run: |
+          dart pub global activate sentry_dart_plugin
+          dart run sentry_dart_plugin
