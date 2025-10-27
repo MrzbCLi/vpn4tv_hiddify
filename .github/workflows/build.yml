@@ -57,7 +57,7 @@ jobs:
             os: ubuntu-latest
             targets: aab
           - platform: windows
-            os: windows-2019
+            os: windows-2022
             targets: exe,msix
     runs-on: ${{ matrix.os }}
     steps:
